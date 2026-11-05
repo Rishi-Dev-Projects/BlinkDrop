@@ -5,7 +5,8 @@ import {
   WifiHigh,
   WifiSlash,
   ShieldCheck,
-  ShieldWarning
+  ShieldWarning,
+  ChartLineUp
 } from '@phosphor-icons/react';
 import { CandidateRouteType, SignalingMode, WebRTCConnectionState } from '../types';
 
@@ -14,13 +15,15 @@ interface HeaderProps {
   connectionState: WebRTCConnectionState;
   routeType: CandidateRouteType;
   onOpenSettings: () => void;
+  onOpenDiagnostics?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   signalingMode,
   connectionState,
   routeType,
-  onOpenSettings
+  onOpenSettings,
+  onOpenDiagnostics
 }) => {
   return (
     <header className="w-full border-b border-midnight-border bg-midnight-void/90 backdrop-blur-md sticky top-0 z-30">
@@ -55,48 +58,55 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
 
         {/* Telemetry and Settings actions */}
-        <div className="flex items-center gap-3">
-          {/* Route Status Badge */}
-          {connectionState === 'connected' && (
+        <div className="flex items-center gap-2 sm:gap-3">
+          {/* Truthful Connection Status Badge */}
+          {connectionState === 'ready' && (
             <div
               className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-mono border ${
                 routeType === 'relayed'
                   ? 'bg-amber-950/40 border-amber-800/60 text-amber-300'
-                  : routeType === 'direct'
-                  ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-300'
-                  : 'bg-midnight-raised border-midnight-border text-slate-300'
+                  : 'bg-emerald-950/40 border-emerald-800/60 text-emerald-300'
               }`}
             >
               {routeType === 'relayed' ? (
                 <>
                   <ShieldWarning size={14} weight="bold" aria-hidden="true" />
-                  <span>Relayed: TURN</span>
-                </>
-              ) : routeType === 'direct' ? (
-                <>
-                  <ShieldCheck size={14} weight="bold" aria-hidden="true" />
-                  <span>Direct: P2P</span>
+                  <span>Ready: Relay</span>
                 </>
               ) : (
                 <>
-                  <WifiHigh size={14} weight="bold" aria-hidden="true" />
-                  <span>Connected</span>
+                  <ShieldCheck size={14} weight="bold" aria-hidden="true" />
+                  <span>Ready: P2P</span>
                 </>
               )}
             </div>
           )}
 
-          {connectionState === 'connecting' && (
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-mono bg-midnight-raised border border-midnight-border text-signal-cyan animate-pulse">
+          {connectionState === 'connected' && (
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-mono bg-cyan-950/40 border border-cyan-800/60 text-cyan-300">
               <WifiHigh size={14} weight="bold" aria-hidden="true" />
-              <span>Handshaking...</span>
+              <span>Opening Channel</span>
             </div>
           )}
 
-          {connectionState === 'disconnected' && (
+          {connectionState === 'connecting' && (
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-mono bg-midnight-raised border border-midnight-border text-amber-400 animate-pulse">
+              <WifiHigh size={14} weight="bold" aria-hidden="true" />
+              <span>Connecting...</span>
+            </div>
+          )}
+
+          {(connectionState === 'waiting' || connectionState === 'disconnected') && (
             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-mono bg-midnight-raised border border-midnight-border text-slate-400">
               <WifiSlash size={14} weight="bold" aria-hidden="true" />
-              <span>Standby</span>
+              <span>{connectionState === 'waiting' ? 'Waiting' : 'Standby'}</span>
+            </div>
+          )}
+
+          {connectionState === 'failed' && (
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-mono bg-rose-950/40 border border-rose-800/60 text-rose-300">
+              <WifiSlash size={14} weight="bold" aria-hidden="true" />
+              <span>Failed</span>
             </div>
           )}
 
@@ -106,12 +116,26 @@ export const Header: React.FC<HeaderProps> = ({
             <span>{signalingMode === 'broadcast' ? 'Local Channel' : 'Firebase Cloud'}</span>
           </div>
 
+          {/* Diagnostics Button */}
+          {onOpenDiagnostics && (
+            <button
+              type="button"
+              onClick={onOpenDiagnostics}
+              className="p-2 rounded-lg bg-midnight-raised hover:bg-midnight-highlight border border-midnight-border text-slate-300 hover:text-signal-cyan transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-signal-cyan"
+              aria-label="Open WebRTC Connection Diagnostics"
+              title="Connection Diagnostics"
+            >
+              <ChartLineUp size={18} weight="bold" aria-hidden="true" />
+            </button>
+          )}
+
           {/* Settings Trigger */}
           <button
             type="button"
             onClick={onOpenSettings}
             className="p-2 rounded-lg bg-midnight-raised hover:bg-midnight-highlight border border-midnight-border text-slate-300 hover:text-white transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-signal-cyan"
             aria-label="Open Signaling & Network Settings"
+            title="Settings"
           >
             <Gear size={18} weight="bold" aria-hidden="true" />
           </button>
@@ -120,4 +144,3 @@ export const Header: React.FC<HeaderProps> = ({
     </header>
   );
 };
-

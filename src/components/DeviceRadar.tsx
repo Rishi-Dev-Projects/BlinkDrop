@@ -4,7 +4,8 @@ import {
   DeviceMobile,
   WifiHigh,
   WifiSlash,
-  CheckCircle
+  CheckCircle,
+  ChartLineUp
 } from '@phosphor-icons/react';
 import { PeerDevice, WebRTCConnectionState, CandidateRouteType } from '../types';
 
@@ -13,15 +14,52 @@ interface DeviceRadarProps {
   remoteDevice: PeerDevice | null;
   connectionState: WebRTCConnectionState;
   routeType: CandidateRouteType;
+  onOpenDiagnostics?: () => void;
 }
 
 export const DeviceRadar: React.FC<DeviceRadarProps> = ({
   localDevice,
   remoteDevice,
   connectionState,
-  routeType
+  routeType,
+  onOpenDiagnostics
 }) => {
   const isMobile = (os: string) => /iOS|Android/i.test(os);
+
+  const getStatusLabel = () => {
+    switch (connectionState) {
+      case 'ready':
+        return `WebRTC DataChannel Active: Ready to transfer (${
+          routeType === 'relayed' ? 'Relay' : 'Direct'
+        })`;
+      case 'connected':
+        return 'Connected: Opening DataChannel...';
+      case 'connecting':
+        return 'Establishing connection: WebRTC handshakes';
+      case 'waiting':
+      case 'disconnected':
+        return 'Awaiting Peer in Room';
+      case 'failed':
+        return 'Connection failed: Check STUN/TURN';
+      default:
+        return 'Awaiting Peer in Room';
+    }
+  };
+
+  const getStatusColorClass = () => {
+    switch (connectionState) {
+      case 'ready':
+        return 'text-emerald-400';
+      case 'connected':
+        return 'text-signal-cyan-bright';
+      case 'connecting':
+        return 'text-amber-400';
+      case 'failed':
+        return 'text-rose-400';
+      default:
+        return 'text-slate-400';
+    }
+  };
 
   return (
     <div className="w-full bg-midnight-void border border-midnight-border rounded-xl p-4 sm:p-6 relative overflow-hidden">
@@ -57,23 +95,31 @@ export const DeviceRadar: React.FC<DeviceRadarProps> = ({
           <div className="w-full flex items-center justify-center gap-2 relative">
             <div
               className={`h-0.5 flex-1 transition-all duration-500 ${
-                connectionState === 'connected'
+                connectionState === 'ready'
+                  ? 'bg-gradient-to-r from-signal-cyan to-emerald-400'
+                  : connectionState === 'connected'
                   ? 'bg-gradient-to-r from-signal-cyan to-signal-violet'
                   : connectionState === 'connecting'
                   ? 'bg-signal-cyan/40 animate-pulse'
+                  : connectionState === 'failed'
+                  ? 'bg-rose-500/50'
                   : 'bg-midnight-highlight border-t border-dashed border-slate-700'
               }`}
             />
             <div
               className={`w-8 h-8 rounded-full border flex items-center justify-center flex-shrink-0 ${
-                connectionState === 'connected'
+                connectionState === 'ready'
+                  ? 'bg-midnight-raised border-emerald-500 text-emerald-400'
+                  : connectionState === 'connected'
                   ? 'bg-midnight-raised border-signal-cyan text-signal-cyan-bright'
                   : connectionState === 'connecting'
                   ? 'bg-midnight-raised border-amber-500/50 text-amber-400 animate-pulse'
+                  : connectionState === 'failed'
+                  ? 'bg-midnight-raised border-rose-500/50 text-rose-400'
                   : 'bg-midnight-raised border-midnight-border text-slate-500'
               }`}
             >
-              {connectionState === 'connected' ? (
+              {connectionState === 'ready' || connectionState === 'connected' ? (
                 <CheckCircle size={16} weight="bold" aria-hidden="true" />
               ) : connectionState === 'connecting' ? (
                 <WifiHigh size={16} weight="bold" aria-hidden="true" />
@@ -83,24 +129,33 @@ export const DeviceRadar: React.FC<DeviceRadarProps> = ({
             </div>
             <div
               className={`h-0.5 flex-1 transition-all duration-500 ${
-                connectionState === 'connected'
+                connectionState === 'ready'
+                  ? 'bg-gradient-to-r from-signal-cyan to-emerald-400'
+                  : connectionState === 'connected'
                   ? 'bg-gradient-to-r from-signal-cyan to-signal-violet'
                   : connectionState === 'connecting'
                   ? 'bg-signal-cyan/40 animate-pulse'
+                  : connectionState === 'failed'
+                  ? 'bg-rose-500/50'
                   : 'bg-midnight-highlight border-t border-dashed border-slate-700'
               }`}
             />
           </div>
 
-          <div className="mt-1.5 text-center">
-            {connectionState === 'connected' ? (
-              <span className="text-xs font-mono text-emerald-400">
-                WebRTC DataChannel Active ({routeType === 'relayed' ? 'Relay' : 'Direct'})
-              </span>
-            ) : connectionState === 'connecting' ? (
-              <span className="text-xs font-mono text-amber-400">Exchanging Coordinates</span>
-            ) : (
-              <span className="text-xs font-mono text-slate-400">Awaiting Peer in Room</span>
+          <div className="mt-1.5 text-center flex flex-col items-center">
+            <span className={`text-xs font-mono ${getStatusColorClass()}`}>
+              {getStatusLabel()}
+            </span>
+            {onOpenDiagnostics && (
+              <button
+                type="button"
+                onClick={onOpenDiagnostics}
+                className="mt-1 text-[11px] font-mono text-slate-400 hover:text-signal-cyan flex items-center gap-1 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-signal-cyan rounded px-1"
+                aria-label="View live WebRTC connection diagnostics"
+              >
+                <ChartLineUp size={12} weight="bold" aria-hidden="true" />
+                <span>Diagnostics</span>
+              </button>
             )}
           </div>
         </div>

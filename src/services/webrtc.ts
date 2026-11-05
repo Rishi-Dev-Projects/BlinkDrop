@@ -3,7 +3,9 @@ import {
   DataChannelControlMessage,
   CandidateRouteType,
   SignalingMessage,
-  PeerDevice
+  PeerDevice,
+  WebRTCConnectionState,
+  ConnectionDiagnostics
 } from '../types';
 import { SignalingChannel } from './signaling';
 import { sanitizeFileName, inferMimeType, MAX_SAFE_FILE_SIZE } from '../utils/file';
@@ -14,7 +16,7 @@ const MAX_CHUNK_SIZE = 32 * 1024; // 32 KB
 const BUFFER_THRESHOLD = 256 * 1024; // 256 KB mobile backpressure threshold
 
 export interface WebRTCEventHandlers {
-  onConnectionStateChange: (state: RTCPeerConnectionState) => void;
+  onConnectionStateChange: (state: WebRTCConnectionState, diagnostics: ConnectionDiagnostics) => void;
   onRouteTypeChange: (route: CandidateRouteType) => void;
   onFileOffered: (file: FileTransferItem) => void;
   onTransferProgress: (
@@ -38,6 +40,13 @@ export class WebRTCManager {
   private roomId: string;
   private handlers: WebRTCEventHandlers;
   private unregisterSignaling: (() => void) | null = null;
+
+  // Diagnostics and timing state
+  private connectionCreatedAt: number | null = null;
+  private dataChannelOpenedAt: number | null = null;
+  private connectionRole: 'offerer' | 'answerer' | 'idle' = 'idle';
+  private currentRouteType: CandidateRouteType = 'unknown';
+  private currentConnectionState: WebRTCConnectionState = 'waiting';
 
   // Active inbound assemblies: fileId -> { meta, chunks, receivedBytes, expectedChunk, lastTimestamp, lastBytes }
   private inboundTransfers = new Map<
@@ -81,6 +90,96 @@ export class WebRTCManager {
     this.handlers = handlers;
 
     this.initSignalingListener();
+    this.emitConnectionState('constructor_initialized');
+  }
+
+  public getDiagnostics(): ConnectionDiagnostics {
+    return {
+      peerId: this.localPeerId,
+      remotePeerId: this.remotePeerId,
+      roomId: this.roomId,
+      connectionRole: this.connectionRole,
+      signalingState: this.peerConnection ? this.peerConnection.signalingState : 'none',
+      iceGatheringState: this.peerConnection ? this.peerConnection.iceGatheringState : 'none',
+      iceConnectionState: this.peerConnection ? this.peerConnection.iceConnectionState : 'none',
+      peerConnectionState: this.peerConnection ? this.peerConnection.connectionState : 'none',
+      dataChannelReadyState: this.dataChannel ? this.dataChannel.readyState : 'none',
+      dataChannelLabel: this.dataChannel ? this.dataChannel.label : 'none',
+      connectionCreatedAt: this.connectionCreatedAt,
+      dataChannelOpenedAt: this.dataChannelOpenedAt,
+      isReadyToTransfer: this.isReady(),
+      signalingMode: this.signaling.mode || 'broadcast',
+      routeType: this.currentRouteType
+    };
+  }
+
+  public isReady(): boolean {
+    return !!this.dataChannel && this.dataChannel.readyState === 'open';
+  }
+
+  public getConnectionState(): WebRTCConnectionState {
+    return this.currentConnectionState;
+  }
+
+  private computeConnectionState(): WebRTCConnectionState {
+    if (!this.peerConnection) {
+      return 'waiting';
+    }
+    const pcState = this.peerConnection.connectionState;
+    const iceState = this.peerConnection.iceConnectionState;
+
+    if (pcState === 'failed' || iceState === 'failed') {
+      return 'failed';
+    }
+    if (pcState === 'disconnected' || pcState === 'closed' || iceState === 'closed') {
+      return 'disconnected';
+    }
+    if (this.dataChannel && this.dataChannel.readyState === 'open') {
+      return 'ready';
+    }
+    if (pcState === 'connected' || iceState === 'connected' || iceState === 'completed') {
+      return 'connected';
+    }
+    if (
+      pcState === 'connecting' ||
+      iceState === 'checking' ||
+      this.isNegotiating ||
+      this.isHandlingOffer
+    ) {
+      return 'connecting';
+    }
+    return 'waiting';
+  }
+
+  private emitConnectionState(reason?: string) {
+    if (reason) {
+      this.logDiagnostics(`State update (${reason})`);
+    }
+    const nextState = this.computeConnectionState();
+    this.currentConnectionState = nextState;
+    const diag = this.getDiagnostics();
+    this.handlers.onConnectionStateChange(nextState, diag);
+  }
+
+  private logDiagnostics(event: string) {
+    const diag = this.getDiagnostics();
+    console.info(`[BlinkDrop WebRTC] ${event}:`, {
+      peerId: diag.peerId,
+      remotePeerId: diag.remotePeerId,
+      roomId: diag.roomId,
+      role: diag.connectionRole,
+      signalingState: diag.signalingState,
+      iceGathering: diag.iceGatheringState,
+      iceConnection: diag.iceConnectionState,
+      peerConnection: diag.peerConnectionState,
+      dataChannelReadyState: diag.dataChannelReadyState,
+      dataChannelLabel: diag.dataChannelLabel,
+      createdAt: diag.connectionCreatedAt,
+      dataChannelOpenedAt: diag.dataChannelOpenedAt,
+      isReadyToTransfer: diag.isReadyToTransfer,
+      route: diag.routeType,
+      signalingMode: diag.signalingMode
+    });
   }
 
   private getOptimalChunkSize(): number {
@@ -100,7 +199,18 @@ export class WebRTCManager {
       switch (msg.type) {
         case 'join':
           this.remotePeerId = msg.senderId;
-          // Respond to the joining peer so discovery is bidirectional
+          this.logDiagnostics('Received peer join message');
+
+          // Clean up stale or failed connection from previous session if present
+          if (
+            this.peerConnection &&
+            (this.peerConnection.connectionState === 'closed' ||
+              this.peerConnection.connectionState === 'failed')
+          ) {
+            this.cleanupPeerConnection();
+          }
+
+          // Respond to joining peer for bidirectional discovery
           await this.signaling.send({
             type: 'join-reply',
             senderId: this.localPeerId,
@@ -109,38 +219,61 @@ export class WebRTCManager {
             roomId: this.roomId,
             timestamp: Date.now()
           });
+
           if (
             this.localPeerId < msg.senderId &&
             (!this.peerConnection || this.peerConnection.connectionState !== 'connected')
           ) {
-            await this.createOffer();
+            await this.createOffer(true);
+          } else {
+            this.emitConnectionState('peer_joined');
           }
           break;
 
         case 'join-reply':
           this.remotePeerId = msg.senderId;
+          this.logDiagnostics('Received peer join-reply message');
+
           if (
             this.localPeerId < msg.senderId &&
             (!this.peerConnection || this.peerConnection.connectionState !== 'connected')
           ) {
-            await this.createOffer();
+            await this.createOffer(true);
+          } else {
+            this.emitConnectionState('peer_join_replied');
           }
           break;
 
         case 'offer':
           if (msg.sdp) {
             this.remotePeerId = msg.senderId;
+            this.logDiagnostics('Received SDP offer');
+
+            if (
+              this.peerConnection &&
+              (this.peerConnection.connectionState === 'closed' ||
+                this.peerConnection.connectionState === 'failed')
+            ) {
+              this.cleanupPeerConnection();
+            }
+
             await this.handleOffer(msg.sdp);
           }
           break;
 
         case 'answer':
           if (msg.sdp && this.peerConnection) {
-            if (this.peerConnection.signalingState === 'have-local-offer' && !this.isSettingRemoteAnswer) {
+            this.logDiagnostics('Received SDP answer');
+            if (
+              this.peerConnection.signalingState === 'have-local-offer' &&
+              !this.isSettingRemoteAnswer
+            ) {
               this.isSettingRemoteAnswer = true;
               try {
                 await this.peerConnection.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                this.logDiagnostics('Remote description applied');
                 await this.drainCandidateQueue();
+                this.emitConnectionState('remote_answer_applied');
               } catch (err) {
                 console.warn('Failed to set remote answer:', err);
               } finally {
@@ -152,7 +285,11 @@ export class WebRTCManager {
 
         case 'candidate':
           if (msg.candidate) {
-            if (this.peerConnection && this.peerConnection.remoteDescription) {
+            if (
+              this.peerConnection &&
+              this.peerConnection.remoteDescription &&
+              this.peerConnection.remoteDescription.type
+            ) {
               try {
                 await this.peerConnection.addIceCandidate(new RTCIceCandidate(msg.candidate));
               } catch {
@@ -165,8 +302,10 @@ export class WebRTCManager {
           break;
 
         case 'leave':
+          this.logDiagnostics('Remote peer left');
           this.handlers.onPeerLeft();
           this.cleanupPeerConnection();
+          this.emitConnectionState('remote_peer_left');
           break;
       }
     });
@@ -180,7 +319,7 @@ export class WebRTCManager {
         try {
           await this.peerConnection.addIceCandidate(new RTCIceCandidate(cand));
         } catch {
-          // Ignore
+          // Ignore late or invalid candidates
         }
       }
     }
@@ -201,6 +340,8 @@ export class WebRTCManager {
 
     const pc = new RTCPeerConnection(config);
     this.peerConnection = pc;
+    this.connectionCreatedAt = Date.now();
+    this.logDiagnostics('RTCPeerConnection created');
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -217,38 +358,42 @@ export class WebRTCManager {
 
     pc.oniceconnectionstatechange = () => {
       const state = pc.iceConnectionState;
+      this.logDiagnostics(`ICE connection state change: ${state}`);
       if (state === 'failed') {
         if (typeof pc.restartIce === 'function') {
           try {
             pc.restartIce();
           } catch {
-            this.handlers.onConnectionStateChange('failed');
+            this.emitConnectionState('ice_restart_failed');
           }
         } else {
-          this.handlers.onConnectionStateChange('failed');
+          this.emitConnectionState('ice_failed');
         }
-      } else if (state === 'disconnected') {
-        this.handlers.onConnectionStateChange('connecting');
-      } else if (state === 'connected' || state === 'completed') {
-        this.handlers.onConnectionStateChange('connected');
+      } else {
+        this.emitConnectionState(`ice_${state}`);
       }
     };
 
     pc.onconnectionstatechange = () => {
-      this.handlers.onConnectionStateChange(pc.connectionState);
-      if (pc.connectionState === 'connected') {
+      const state = pc.connectionState;
+      this.logDiagnostics(`Peer connection state change: ${state}`);
+      if (state === 'connected') {
         this.startStatsMonitoring();
-      } else if (
-        pc.connectionState === 'disconnected' ||
-        pc.connectionState === 'failed' ||
-        pc.connectionState === 'closed'
-      ) {
+      } else if (state === 'disconnected' || state === 'failed' || state === 'closed') {
         this.stopStatsMonitoring();
+        this.currentRouteType = 'unknown';
         this.handlers.onRouteTypeChange('unknown');
       }
+      this.emitConnectionState(`pc_${state}`);
+    };
+
+    pc.onsignalingstatechange = () => {
+      this.logDiagnostics(`Signaling state change: ${pc.signalingState}`);
+      this.emitConnectionState(`signaling_${pc.signalingState}`);
     };
 
     pc.ondatachannel = (event) => {
+      this.logDiagnostics('DataChannel received via ondatachannel');
       this.setupDataChannel(event.channel);
     };
 
@@ -261,16 +406,20 @@ export class WebRTCManager {
     channel.bufferedAmountLowThreshold = BUFFER_THRESHOLD;
 
     channel.onopen = () => {
-      this.handlers.onConnectionStateChange('connected');
+      this.dataChannelOpenedAt = Date.now();
+      this.logDiagnostics('DataChannel open event fired');
       this.startStatsMonitoring();
+      this.emitConnectionState('datachannel_opened');
     };
 
     channel.onclose = () => {
-      this.handlers.onConnectionStateChange('disconnected');
+      this.logDiagnostics('DataChannel closed event fired');
+      this.emitConnectionState('datachannel_closed');
     };
 
     channel.onerror = (err) => {
       console.warn('DataChannel warning/error:', err);
+      this.logDiagnostics('DataChannel error event fired');
     };
 
     channel.onmessage = (event) => {
@@ -284,9 +433,19 @@ export class WebRTCManager {
         this.handleBinaryChunk(event.data);
       }
     };
+
+    // If channel is already open on attachment, notify immediately
+    if (channel.readyState === 'open') {
+      this.dataChannelOpenedAt = Date.now();
+      this.logDiagnostics('DataChannel already in open readyState');
+      this.startStatsMonitoring();
+      this.emitConnectionState('datachannel_ready_immediate');
+    }
   }
 
   public async announceJoin() {
+    this.logDiagnostics('Announcing room presence');
+    this.emitConnectionState('announcing_join');
     await this.signaling.send({
       type: 'join',
       senderId: this.localPeerId,
@@ -296,13 +455,25 @@ export class WebRTCManager {
     });
   }
 
-  public async createOffer() {
-    if (this.hasCreatedOffer || this.isNegotiating) return;
-    if (this.peerConnection && this.peerConnection.signalingState !== 'stable') return;
-    if (this.dataChannel && this.dataChannel.readyState === 'open') return;
+  public async createOffer(force = false) {
+    if (this.isNegotiating) return;
+    if (
+      !force &&
+      this.hasCreatedOffer &&
+      this.peerConnection &&
+      this.peerConnection.signalingState !== 'closed'
+    ) {
+      if (this.dataChannel && this.dataChannel.readyState === 'open') return;
+    }
+
+    if (force) {
+      this.hasCreatedOffer = false;
+    }
 
     this.hasCreatedOffer = true;
     this.isNegotiating = true;
+    this.connectionRole = 'offerer';
+
     try {
       const pc = this.createPeerConnection();
       if (!this.dataChannel || this.dataChannel.readyState === 'closed') {
@@ -316,17 +487,24 @@ export class WebRTCManager {
       if (pc.signalingState !== 'stable') return;
       await pc.setLocalDescription(offer);
 
+      this.logDiagnostics('SDP offer generated and applied locally');
+      this.emitConnectionState('local_offer_created');
+
       await this.signaling.send({
         type: 'offer',
         senderId: this.localPeerId,
         targetId: this.remotePeerId || undefined,
         roomId: this.roomId,
-        sdp: offer,
+        sdp: {
+          type: offer.type,
+          sdp: offer.sdp || ''
+        },
         timestamp: Date.now()
       });
     } catch (err) {
       console.warn('Failed to create/send offer:', err);
       this.hasCreatedOffer = false;
+      this.emitConnectionState('offer_creation_failed');
     } finally {
       this.isNegotiating = false;
     }
@@ -338,6 +516,8 @@ export class WebRTCManager {
 
     this.hasHandledOffer = true;
     this.isHandlingOffer = true;
+    this.connectionRole = 'answerer';
+
     try {
       const pc = this.createPeerConnection();
       await pc.setRemoteDescription(new RTCSessionDescription(sdp));
@@ -345,17 +525,24 @@ export class WebRTCManager {
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
 
+      this.logDiagnostics('SDP answer generated and applied locally');
+      this.emitConnectionState('local_answer_created');
+
       await this.signaling.send({
         type: 'answer',
         senderId: this.localPeerId,
         targetId: this.remotePeerId || undefined,
         roomId: this.roomId,
-        sdp: answer,
+        sdp: {
+          type: answer.type,
+          sdp: answer.sdp || ''
+        },
         timestamp: Date.now()
       });
     } catch (err) {
       console.warn('Failed to handle offer:', err);
       this.hasHandledOffer = false;
+      this.emitConnectionState('offer_handling_failed');
     } finally {
       this.isHandlingOffer = false;
     }
@@ -382,13 +569,20 @@ export class WebRTCManager {
           const localCandidate = stats.get(activeCandidatePair.localCandidateId);
           const remoteCandidate = stats.get(activeCandidatePair.remoteCandidateId);
 
+          let detectedRoute: CandidateRouteType = 'unknown';
           if (
             localCandidate?.candidateType === 'relay' ||
             remoteCandidate?.candidateType === 'relay'
           ) {
-            this.handlers.onRouteTypeChange('relayed');
+            detectedRoute = 'relayed';
           } else if (localCandidate && remoteCandidate) {
-            this.handlers.onRouteTypeChange('direct');
+            detectedRoute = 'direct';
+          }
+
+          if (detectedRoute !== this.currentRouteType) {
+            this.currentRouteType = detectedRoute;
+            this.handlers.onRouteTypeChange(detectedRoute);
+            this.emitConnectionState('route_type_updated');
           }
         }
       } catch {
@@ -409,7 +603,7 @@ export class WebRTCManager {
   private handleControlMessage(msg: DataChannelControlMessage) {
     switch (msg.type) {
       case 'FILE_OFFER': {
-        // Validate incoming file metadata & size limits
+        // Validate incoming file metadata and size limits
         if (!msg.size || msg.size <= 0 || !Number.isFinite(msg.size)) {
           this.sendControlMessage({
             type: 'FILE_REJECT',
@@ -632,8 +826,11 @@ export class WebRTCManager {
   }
 
   public async sendFile(fileItem: FileTransferItem): Promise<void> {
-    if (!fileItem.file || !this.dataChannel || this.dataChannel.readyState !== 'open') {
-      throw new Error('DataChannel is not open or file is missing');
+    if (!fileItem.file) {
+      throw new Error('File payload is missing');
+    }
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+      throw new Error('WebRTC DataChannel is not open. Wait for connection readiness.');
     }
 
     const file = fileItem.file;
@@ -751,20 +948,37 @@ export class WebRTCManager {
     this.hasHandledOffer = false;
     this.isHandlingOffer = false;
     this.isSettingRemoteAnswer = false;
+    this.connectionRole = 'idle';
+    this.connectionCreatedAt = null;
+    this.dataChannelOpenedAt = null;
+    this.candidateQueue = [];
+
     this.pendingApprovals.forEach((pending) => {
       pending.reject(new Error('Connection closed'));
     });
     this.pendingApprovals.clear();
+
     if (this.dataChannel) {
-      this.dataChannel.close();
+      try {
+        this.dataChannel.close();
+      } catch {
+        // ignore
+      }
       this.dataChannel = null;
     }
+
     if (this.peerConnection) {
-      this.peerConnection.close();
+      try {
+        this.peerConnection.close();
+      } catch {
+        // ignore
+      }
       this.peerConnection = null;
     }
+
     this.inboundTransfers.clear();
     this.activeOutboundFileId = null;
+    this.logDiagnostics('PeerConnection and DataChannel cleaned up');
   }
 
   public destroy() {
@@ -774,5 +988,6 @@ export class WebRTCManager {
       this.unregisterSignaling = null;
     }
     this.signaling.close();
+    this.emitConnectionState('destroyed');
   }
 }

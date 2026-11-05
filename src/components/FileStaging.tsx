@@ -65,7 +65,24 @@ export const FileStaging: React.FC<FileStagingProps> = ({
     return <FileText size={24} weight="bold" className="text-slate-300" aria-hidden="true" />;
   };
 
-  const isConnected = connectionState === 'connected';
+  const isReadyToTransfer = connectionState === 'ready';
+
+  const getStatusNotice = () => {
+    switch (connectionState) {
+      case 'waiting':
+        return 'Notice: Waiting for remote peer to join room.';
+      case 'connecting':
+        return 'Notice: Establishing WebRTC connection...';
+      case 'connected':
+        return 'Notice: WebRTC peer connected, opening secure DataChannel...';
+      case 'disconnected':
+        return 'Notice: Remote peer disconnected.';
+      case 'failed':
+        return 'Notice: WebRTC connection failed. Check STUN/TURN or network connection.';
+      default:
+        return '';
+    }
+  };
 
   return (
     <div className="w-full bg-midnight-void border border-midnight-border rounded-xl p-4 sm:p-6">
@@ -78,9 +95,10 @@ export const FileStaging: React.FC<FileStagingProps> = ({
           <button
             type="button"
             onClick={onSendAll}
-            disabled={!isConnected}
+            disabled={!isReadyToTransfer}
+            title={isReadyToTransfer ? 'Send all staged files' : 'WebRTC DataChannel must be open to transfer files'}
             className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium min-h-[44px] transition-all cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-signal-cyan ${
-              isConnected
+              isReadyToTransfer
                 ? 'bg-signal-cyan hover:bg-signal-cyan-bright text-midnight-base font-semibold shadow-sm'
                 : 'bg-midnight-raised border border-midnight-border text-slate-500 cursor-not-allowed'
             }`}
@@ -162,10 +180,11 @@ export const FileStaging: React.FC<FileStagingProps> = ({
                       e.stopPropagation();
                       onSendFile(file.id);
                     }}
-                    disabled={!isConnected}
+                    disabled={!isReadyToTransfer}
+                    title={isReadyToTransfer ? `Send ${file.name}` : 'WebRTC DataChannel must be open to transfer files'}
                     aria-label={`Send ${file.name}`}
                     className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium min-h-[44px] transition-all cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-signal-cyan ${
-                      isConnected
+                      isReadyToTransfer
                         ? 'bg-signal-cyan hover:bg-signal-cyan-bright text-midnight-base font-semibold'
                         : 'bg-midnight-raised border border-midnight-border text-slate-500 cursor-not-allowed'
                     }`}
@@ -190,9 +209,9 @@ export const FileStaging: React.FC<FileStagingProps> = ({
             ))}
           </div>
 
-          {!isConnected && (
+          {!isReadyToTransfer && (
             <p className="text-xs text-amber-400 font-mono mt-2 flex items-center gap-1.5">
-              <span>Notice: Connect to a remote peer to initiate transfer.</span>
+              <span>{getStatusNotice()}</span>
             </p>
           )}
         </div>

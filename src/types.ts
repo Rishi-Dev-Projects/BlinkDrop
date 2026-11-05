@@ -2,9 +2,41 @@ export type SignalingMode = 'broadcast' | 'firebase';
 
 export type SignalingState = 'disconnected' | 'connecting' | 'connected' | 'error';
 
-export type WebRTCConnectionState = 'disconnected' | 'connecting' | 'connected' | 'failed';
+export type WebRTCConnectionState =
+  | 'waiting'
+  | 'connecting'
+  | 'connected'
+  | 'ready'
+  | 'disconnected'
+  | 'failed';
 
 export type CandidateRouteType = 'unknown' | 'direct' | 'relayed';
+
+export type CameraState =
+  | 'requesting_permission'
+  | 'initializing'
+  | 'ready'
+  | 'unavailable'
+  | 'denied'
+  | 'failed';
+
+export interface ConnectionDiagnostics {
+  peerId: string;
+  remotePeerId: string | null;
+  roomId: string;
+  connectionRole: 'offerer' | 'answerer' | 'idle';
+  signalingState: string;
+  iceGatheringState: string;
+  iceConnectionState: string;
+  peerConnectionState: string;
+  dataChannelReadyState: string;
+  dataChannelLabel: string;
+  connectionCreatedAt: number | null;
+  dataChannelOpenedAt: number | null;
+  isReadyToTransfer: boolean;
+  signalingMode: SignalingMode;
+  routeType: CandidateRouteType;
+}
 
 export interface PeerDevice {
   id: string;

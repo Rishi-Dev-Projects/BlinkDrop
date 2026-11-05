@@ -6,13 +6,15 @@ import { FileStaging } from './components/FileStaging';
 import { TransferConsole } from './components/TransferConsole';
 import { SignalingSettingsModal } from './components/SignalingSettingsModal';
 import { QrScannerModal } from './components/QrScannerModal';
+import { DiagnosticsModal } from './components/DiagnosticsModal';
 import {
   SignalingMode,
   FirebaseConfig,
   PeerDevice,
   WebRTCConnectionState,
   CandidateRouteType,
-  FileTransferItem
+  FileTransferItem,
+  ConnectionDiagnostics
 } from './types';
 import { detectDevice, generateRoomCode } from './utils/device';
 import {
@@ -52,7 +54,12 @@ export const App: React.FC = () => {
 
   const [signalingMode, setSignalingMode] = useState<SignalingMode>(() => {
     const saved = localStorage.getItem('blinkdrop_signaling_mode');
-    return saved === 'firebase' ? 'firebase' : 'broadcast';
+    if (saved === 'firebase' || saved === 'broadcast') return saved;
+    // Default to firebase for immediate cross-device operation when env keys exist
+    if (import.meta.env.VITE_FIREBASE_API_KEY && import.meta.env.VITE_FIREBASE_PROJECT_ID) {
+      return 'firebase';
+    }
+    return 'broadcast';
   });
 
   const [firebaseConfig, setFirebaseConfig] = useState<FirebaseConfig | null>(() => {
@@ -75,8 +82,10 @@ export const App: React.FC = () => {
     return null;
   });
 
-  const [connectionState, setConnectionState] = useState<WebRTCConnectionState>('disconnected');
+  const [connectionState, setConnectionState] = useState<WebRTCConnectionState>('waiting');
   const [routeType, setRouteType] = useState<CandidateRouteType>('unknown');
+  const [diagnostics, setDiagnostics] = useState<ConnectionDiagnostics | null>(null);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
 
   const [stagedFiles, setStagedFiles] = useState<FileTransferItem[]>([]);
   const [transfers, setTransfers] = useState<FileTransferItem[]>([]);
@@ -117,21 +126,20 @@ export const App: React.FC = () => {
 
     // Instantiating WebRTC manager
     const manager = new WebRTCManager(localDevice, roomId, signaling, {
-      onConnectionStateChange: (state) => {
-        if (state === 'connected') {
-          setConnectionState('connected');
-          showBanner('Peer WebRTC channel connected successfully', 'success');
-        } else if (state === 'connecting') {
-          setConnectionState('connecting');
+      onConnectionStateChange: (state, diag) => {
+        setConnectionState(state);
+        if (diag) {
+          setDiagnostics(diag);
+        }
+        if (state === 'ready') {
+          showBanner('WebRTC DataChannel connected and ready to transfer', 'success');
         } else if (state === 'failed') {
-          setConnectionState('failed');
           showBanner('WebRTC connection failed. Verify network or STUN/TURN access', 'error');
-        } else {
-          setConnectionState('disconnected');
         }
       },
       onRouteTypeChange: (route) => {
         setRouteType(route);
+        setDiagnostics((prev) => (prev ? { ...prev, routeType: route } : null));
       },
       onFileOffered: (inboundItem) => {
         setTransfers((prev) => [inboundItem, ...prev]);
@@ -180,6 +188,7 @@ export const App: React.FC = () => {
     });
 
     webrtcManagerRef.current = manager;
+    setDiagnostics(manager.getDiagnostics());
 
     // Listen for peer-join discovery via signaling
     const unreg = signaling.onMessage((msg) => {
@@ -342,7 +351,7 @@ export const App: React.FC = () => {
     const newCode = generateRoomCode();
     setRoomId(newCode);
     setRemoteDevice(null);
-    setConnectionState('disconnected');
+    setConnectionState('waiting');
     setRouteType('unknown');
     showBanner(`Created new room: ${newCode}`, 'info');
   };
@@ -351,7 +360,7 @@ export const App: React.FC = () => {
     const clean = targetRoomId.trim().toUpperCase();
     setRoomId(clean);
     setRemoteDevice(null);
-    setConnectionState('disconnected');
+    setConnectionState('waiting');
     setRouteType('unknown');
     showBanner(`Joined room: ${clean}`, 'info');
   };
@@ -375,6 +384,7 @@ export const App: React.FC = () => {
         connectionState={connectionState}
         routeType={routeType}
         onOpenSettings={() => setSettingsOpen(true)}
+        onOpenDiagnostics={() => setDiagnosticsOpen(true)}
       />
 
       {/* Floating Status Notification Banner */}
@@ -435,6 +445,7 @@ export const App: React.FC = () => {
             remoteDevice={remoteDevice}
             connectionState={connectionState}
             routeType={routeType}
+            onOpenDiagnostics={() => setDiagnosticsOpen(true)}
           />
         </section>
 
@@ -504,6 +515,14 @@ export const App: React.FC = () => {
         isOpen={scannerOpen}
         onClose={() => setScannerOpen(false)}
         onScanSuccess={handleJoinRoom}
+      />
+
+      {/* Connection Diagnostics Modal */}
+      <DiagnosticsModal
+        isOpen={diagnosticsOpen}
+        onClose={() => setDiagnosticsOpen(false)}
+        diagnostics={diagnostics}
+        connectionState={connectionState}
       />
     </div>
   );

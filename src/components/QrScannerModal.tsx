@@ -1,6 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Camera, CameraSlash, X, WarningCircle, Keyboard } from '@phosphor-icons/react';
+import {
+  Camera,
+  CameraSlash,
+  X,
+  WarningCircle,
+  Keyboard,
+  CircleNotch
+} from '@phosphor-icons/react';
 import jsQR from 'jsqr';
+import { CameraState } from '../types';
 
 interface QrScannerModalProps {
   isOpen: boolean;
@@ -13,7 +21,7 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({
   onClose,
   onScanSuccess
 }) => {
-  const [permissionState, setPermissionState] = useState<'prompt' | 'granted' | 'denied' | 'unsupported'>('prompt');
+  const [cameraState, setCameraState] = useState<CameraState>('requesting_permission');
   const [errorMessage, setErrorMessage] = useState<string>('');
   const [manualCode, setManualCode] = useState<string>('');
   const [manualError, setManualError] = useState<string>('');
@@ -23,7 +31,7 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({
   const animationFrameRef = useRef<number | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Stop all camera tracks cleanly
+  // Stop all camera tracks and animation cleanly
   const stopCamera = () => {
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
@@ -40,6 +48,11 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({
       streamRef.current = null;
     }
     if (videoRef.current) {
+      try {
+        videoRef.current.pause();
+      } catch {
+        // ignore
+      }
       videoRef.current.srcObject = null;
     }
   };
@@ -49,32 +62,56 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({
     if (!isOpen) {
       stopCamera();
       setErrorMessage('');
-      setPermissionState('prompt');
-      return;
-    }
-
-    // Check secure context requirement
-    if (typeof window !== 'undefined' && !window.isSecureContext) {
-      setPermissionState('unsupported');
-      setErrorMessage(
-        'Camera access requires a Secure Context (HTTPS or localhost). On local Wi-Fi, enable HTTPS or enter the room code manually.'
-      );
-      return;
-    }
-
-    // Check if mediaDevices exists
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setPermissionState('unsupported');
-      setErrorMessage('Camera access is not supported by this browser. Please use manual room entry.');
+      setCameraState('requesting_permission');
       return;
     }
 
     let isMounted = true;
 
+    const handleCameraError = (err: any) => {
+      if (!isMounted) return;
+      console.warn('Camera initialization error:', err);
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setCameraState('denied');
+        setErrorMessage(
+          'Camera permission was denied. Allow camera permissions in your browser or device settings, or enter the room code manually below.'
+        );
+      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+        setCameraState('unavailable');
+        setErrorMessage('No camera device was detected on this hardware.');
+      } else {
+        setCameraState('failed');
+        setErrorMessage(err.message || 'Unable to access camera feed.');
+      }
+    };
+
+    // Check secure context requirement
+    if (typeof window !== 'undefined' && !window.isSecureContext) {
+      setCameraState('unavailable');
+      setErrorMessage(
+        'Camera access requires a Secure Context (HTTPS or localhost). On local networks, serve via HTTPS or enter the room code manually.'
+      );
+      return;
+    }
+
+    // Check mediaDevices support
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setCameraState('unavailable');
+      setErrorMessage(
+        'Camera access is not supported by this browser. Please use manual room entry.'
+      );
+      return;
+    }
+
     async function startCamera() {
+      setCameraState('requesting_permission');
+      setErrorMessage('');
+
+      let stream: MediaStream;
+
+      // Prefer rear camera on mobile devices with fallback to standard camera
       try {
-        setErrorMessage('');
-        const stream = await navigator.mediaDevices.getUserMedia({
+        stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: { ideal: 'environment' },
             width: { ideal: 1280 },
@@ -82,34 +119,76 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({
           },
           audio: false
         });
-
-        if (!isMounted) {
-          stream.getTracks().forEach((t) => t.stop());
+      } catch (err: any) {
+        if (
+          err.name === 'OverconstrainedError' ||
+          err.name === 'ConstraintNotSatisfiedError'
+        ) {
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: true,
+              audio: false
+            });
+          } catch (fallbackErr: any) {
+            handleCameraError(fallbackErr);
+            return;
+          }
+        } else {
+          handleCameraError(err);
           return;
         }
+      }
 
-        streamRef.current = stream;
-        setPermissionState('granted');
+      if (!isMounted) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
 
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.setAttribute('playsinline', 'true'); // Required for iOS and Android webview
-          await videoRef.current.play();
-          startScanningLoop();
+      streamRef.current = stream;
+      setCameraState('initializing');
+
+      const video = videoRef.current;
+      if (!video) {
+        setCameraState('failed');
+        setErrorMessage('Video presentation element could not be initialized.');
+        return;
+      }
+
+      video.srcObject = stream;
+      video.setAttribute('playsinline', 'true');
+      video.setAttribute('autoplay', 'true');
+      video.setAttribute('muted', 'true');
+
+      // Await video metadata to guarantee frame dimensions are ready
+      try {
+        if (video.readyState < video.HAVE_METADATA) {
+          await new Promise<void>((resolve, reject) => {
+            const onLoaded = () => {
+              video.removeEventListener('loadedmetadata', onLoaded);
+              video.removeEventListener('error', onError);
+              resolve();
+            };
+            const onError = () => {
+              video.removeEventListener('loadedmetadata', onLoaded);
+              video.removeEventListener('error', onError);
+              reject(new Error('Failed loading video stream metadata.'));
+            };
+            video.addEventListener('loadedmetadata', onLoaded);
+            video.addEventListener('error', onError);
+          });
         }
-      } catch (err: any) {
+
         if (!isMounted) return;
-        console.warn('Camera request error:', err);
-        setPermissionState('denied');
-        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-          setErrorMessage(
-            'Camera permission was denied. Allow camera access in browser site settings or enter the room code manually.'
-          );
-        } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-          setErrorMessage('No camera device was detected on this hardware.');
-        } else {
-          setErrorMessage(err.message || 'Unable to access camera.');
-        }
+        await video.play();
+        if (!isMounted) return;
+
+        setCameraState('ready');
+        startScanningLoop();
+      } catch (playErr: any) {
+        if (!isMounted) return;
+        console.warn('Video play execution failed:', playErr);
+        setCameraState('failed');
+        setErrorMessage('Failed to start camera video playback. Please enter room code manually.');
       }
     }
 
@@ -271,17 +350,19 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({
           </button>
         </div>
 
-        {/* Video Camera Viewport */}
+        {/* Video Camera Viewport: Video element is ALWAYS mounted to prevent React ref race conditions */}
         <div className="relative w-full aspect-square max-h-72 bg-midnight-base rounded-lg overflow-hidden border border-midnight-highlight flex items-center justify-center">
-          {permissionState === 'granted' ? (
+          <video
+            ref={videoRef}
+            className={`w-full h-full object-cover ${cameraState === 'ready' ? 'block' : 'opacity-0 absolute inset-0 pointer-events-none'}`}
+            muted
+            autoPlay
+            playsInline
+          />
+
+          {/* Active Scanner View: Visible only when cameraState is ready */}
+          {cameraState === 'ready' && (
             <>
-              <video
-                ref={videoRef}
-                className="w-full h-full object-cover"
-                muted
-                autoPlay
-                playsInline
-              />
               {/* Aiming Reticle */}
               <div className="absolute inset-8 border-2 border-signal-cyan/60 rounded-lg pointer-events-none flex items-center justify-center shadow-sm">
                 <div className="w-full h-0.5 bg-signal-cyan/40 animate-pulse" />
@@ -290,19 +371,75 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({
                 Point camera at desktop screen QR code
               </p>
             </>
-          ) : (
-            <div className="p-4 text-center space-y-2">
-              <div className="w-12 h-12 rounded-full bg-midnight-raised border border-midnight-border mx-auto flex items-center justify-center text-slate-400">
-                <CameraSlash size={24} weight="bold" aria-hidden="true" />
-              </div>
-              <p className="text-xs text-slate-300 font-medium">
-                {errorMessage || 'Initializing camera feed...'}
-              </p>
+          )}
+
+          {/* Overlay States for non-ready states */}
+          {cameraState !== 'ready' && (
+            <div className="p-4 text-center space-y-3 z-10 max-w-xs">
+              {cameraState === 'requesting_permission' && (
+                <>
+                  <div className="w-12 h-12 rounded-full bg-midnight-raised border border-midnight-border mx-auto flex items-center justify-center text-signal-cyan animate-pulse">
+                    <Camera size={24} weight="bold" aria-hidden="true" />
+                  </div>
+                  <div>
+                    <p className="text-xs text-white font-medium">Requesting camera permission</p>
+                    <p className="text-[11px] text-slate-400 mt-0.5">Please allow camera access in the browser prompt</p>
+                  </div>
+                </>
+              )}
+
+              {cameraState === 'initializing' && (
+                <>
+                  <div className="w-12 h-12 rounded-full bg-midnight-raised border border-midnight-border mx-auto flex items-center justify-center text-signal-cyan">
+                    <CircleNotch size={24} weight="bold" className="animate-spin" aria-hidden="true" />
+                  </div>
+                  <div>
+                    <p className="text-xs text-white font-medium">Initialising camera feed</p>
+                    <p className="text-[11px] text-slate-400 mt-0.5">Starting video streaming...</p>
+                  </div>
+                </>
+              )}
+
+              {cameraState === 'denied' && (
+                <>
+                  <div className="w-12 h-12 rounded-full bg-midnight-raised border border-rose-500/30 mx-auto flex items-center justify-center text-rose-400">
+                    <CameraSlash size={24} weight="bold" aria-hidden="true" />
+                  </div>
+                  <div>
+                    <p className="text-xs text-rose-300 font-medium">Permission denied</p>
+                    <p className="text-[11px] text-slate-400 mt-0.5">Camera access was blocked by the browser</p>
+                  </div>
+                </>
+              )}
+
+              {cameraState === 'unavailable' && (
+                <>
+                  <div className="w-12 h-12 rounded-full bg-midnight-raised border border-midnight-border mx-auto flex items-center justify-center text-slate-400">
+                    <CameraSlash size={24} weight="bold" aria-hidden="true" />
+                  </div>
+                  <div>
+                    <p className="text-xs text-slate-300 font-medium">Camera unavailable</p>
+                    <p className="text-[11px] text-slate-400 mt-0.5">Secure context or camera hardware required</p>
+                  </div>
+                </>
+              )}
+
+              {cameraState === 'failed' && (
+                <>
+                  <div className="w-12 h-12 rounded-full bg-midnight-raised border border-amber-500/30 mx-auto flex items-center justify-center text-amber-400">
+                    <WarningCircle size={24} weight="bold" aria-hidden="true" />
+                  </div>
+                  <div>
+                    <p className="text-xs text-amber-300 font-medium">Scanner failed</p>
+                    <p className="text-[11px] text-slate-400 mt-0.5">Could not start video stream</p>
+                  </div>
+                </>
+              )}
             </div>
           )}
         </div>
 
-        {/* Permission / Insecure Notice */}
+        {/* Detailed Status / Error Notice */}
         {errorMessage && (
           <div className="p-3 bg-amber-950/40 border border-amber-800/60 rounded-lg text-xs text-amber-200 flex items-start gap-2">
             <WarningCircle size={16} weight="bold" className="text-amber-400 flex-shrink-0 mt-0.5" aria-hidden="true" />
@@ -310,7 +447,7 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({
           </div>
         )}
 
-        {/* Manual Room Entry Fallback */}
+        {/* Manual Room Entry Fallback: Always Available in all camera states */}
         <div className="pt-2 border-t border-midnight-border space-y-2">
           <div className="flex items-center gap-1.5 text-xs text-slate-400 font-mono">
             <Keyboard size={14} weight="bold" aria-hidden="true" />
@@ -330,7 +467,7 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({
                   setManualCode(e.target.value);
                   if (manualError) setManualError('');
                 }}
-                placeholder="6-character Room Key"
+                placeholder="4 to 12 character Room Key"
                 maxLength={12}
                 className="w-full bg-midnight-base border border-midnight-border rounded-lg px-3 py-2 text-white font-mono text-xs focus:border-signal-cyan focus:outline-none min-h-[44px]"
               />
