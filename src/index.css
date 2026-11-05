@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Rule R-39: Explicit cursor indicators on all interactive elements */
+  a[href],
+  button,
+  input[type="submit"],
+  input[type="button"],
+  input[type="reset"],
+  [role="button"],
+  label[for] {
+    cursor: pointer;
+  }
+
+  button:disabled,
+  input:disabled,
+  [aria-disabled="true"] {
+    cursor: not-allowed;
+  }
+
+  /* Rule R-32: Visible custom focus indicator */
+  :focus-visible {
+    outline: 2px solid #06B6D4;
+    outline-offset: 2px;
+  }
+
+  body {
+    margin: 0;
+    background-color: #080C14;
+    color: #F8FAFC;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+}
+
+/* Rule R-39: Reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+

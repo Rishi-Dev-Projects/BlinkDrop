@@ -1,0 +1,222 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: blinkdrop_rooms/{roomId}
+    // Document ID: roomId (4 to 12 alphanumeric characters, e.g. "E2E123", "ABCDEF")
+    // Fields:
+    //   - roomId: string (required, 4-12 alphanumeric characters, matches document path)
+    //   - updatedAt: number or timestamp (required, positive integer or Firestore timestamp)
+    //   - lastMessage: string (optional, max 100 characters)
+    //   - createdAt: number or timestamp (optional, positive integer or Firestore timestamp)
+    //
+    // Subcollection: blinkdrop_rooms/{roomId}/messages/{messageId}
+    // Document ID: auto-generated message ID
+    // Fields:
+    //   - type: string (required, enum in ['join', 'join-reply', 'offer', 'answer', 'leave'])
+    //   - senderId: string (required, 1-64 characters)
+    //   - senderDevice: map (optional, device telemetry: id, name, os, browser, joinedAt)
+    //   - targetId: string (optional, 1-64 characters)
+    //   - roomId: string (required, 4-12 alphanumeric characters, matches parent roomId)
+    //   - sdp: map (optional, WebRTC SDP description: type in ['offer','answer','pranswer','rollback'], sdp string <= 32768 chars)
+    //   - timestamp: number or timestamp (required, positive integer or Firestore timestamp)
+    //
+    // Subcollection: blinkdrop_rooms/{roomId}/candidates/{candidateId}
+    // Document ID: auto-generated candidate ID
+    // Fields:
+    //   - type: string (required, value: 'candidate')
+    //   - senderId: string (required, 1-64 characters)
+    //   - targetId: string (optional, 1-64 characters)
+    //   - roomId: string (required, 4-12 alphanumeric characters, matches parent roomId)
+    //   - candidate: map (required, RTCIceCandidateInit: candidate string <= 4096 chars, sdpMid, sdpMLineIndex, usernameFragment)
+    //   - timestamp: number or timestamp (required, positive integer or Firestore timestamp)
+    //
+    // NOTE ON FILE DATA & SIGNALING PAYLOADS:
+    // BlinkDrop transfers files strictly peer-to-peer over WebRTC RTCDataChannel.
+    // Firestore is exclusively used as an ephemeral signaling channel for SDP and ICE coordination.
+    // File contents, binary payloads, chunks, and base64 buffers are STRICTLY PROHIBITED in Firestore.
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if client is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Validate required fields exist in request data
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Validate document contains only allowed fields (Strict Schema Enforcement)
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // Validate that specified immutable fields have not been modified on update
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Validate room ID format (4 to 12 alphanumeric characters)
+    function isValidRoomId(id) {
+      return id is string && id.matches('^[a-zA-Z0-9]{4,12}$');
+    }
+
+    // Validate timestamp or positive number (e.g., Date.now() in milliseconds)
+    function isValidTimestampValue(val) {
+      return (val is number && val > 0) || (val is timestamp);
+    }
+
+    // Validate senderDevice telemetry map structure
+    function isValidSenderDevice(dev) {
+      return dev is map &&
+             dev.keys().hasOnly(['id', 'name', 'os', 'browser', 'joinedAt']) &&
+             dev.keys().hasAll(['id', 'name', 'os', 'browser']) &&
+             dev.id is string && dev.id.size() >= 1 && dev.id.size() <= 64 &&
+             dev.name is string && dev.name.size() <= 100 &&
+             dev.os is string && dev.os.size() <= 50 &&
+             dev.browser is string && dev.browser.size() <= 50 &&
+             (!('joinedAt' in dev) || isValidTimestampValue(dev.joinedAt));
+    }
+
+    // Validate WebRTC Session Description (SDP) map
+    function isValidSdp(sdp) {
+      return sdp is map &&
+             sdp.keys().hasOnly(['type', 'sdp']) &&
+             sdp.keys().hasAll(['type', 'sdp']) &&
+             sdp.type is string && sdp.type in ['offer', 'answer', 'pranswer', 'rollback'] &&
+             sdp.sdp is string && sdp.sdp.size() >= 1 && sdp.sdp.size() <= 32768;
+    }
+
+    // Validate RTCIceCandidate map
+    function isValidCandidateMap(cand) {
+      return cand is map &&
+             cand.keys().hasOnly(['candidate', 'sdpMid', 'sdpMLineIndex', 'usernameFragment']) &&
+             (!('candidate' in cand) || (cand.candidate is string && cand.candidate.size() <= 4096)) &&
+             (!('sdpMid' in cand) || cand.sdpMid == null || (cand.sdpMid is string && cand.sdpMid.size() <= 64)) &&
+             (!('sdpMLineIndex' in cand) || cand.sdpMLineIndex == null || (cand.sdpMLineIndex is number && cand.sdpMLineIndex >= 0 && cand.sdpMLineIndex <= 1000)) &&
+             (!('usernameFragment' in cand) || cand.usernameFragment == null || (cand.usernameFragment is string && cand.usernameFragment.size() <= 128));
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    // Validate room document data model
+    function isValidRoom(data) {
+      return hasRequiredFields(['roomId', 'updatedAt']) &&
+             hasOnlyAllowedFields(['roomId', 'updatedAt', 'lastMessage', 'createdAt']) &&
+             data.roomId is string &&
+             isValidRoomId(data.roomId) &&
+             isValidTimestampValue(data.updatedAt) &&
+             (!('createdAt' in data) || isValidTimestampValue(data.createdAt)) &&
+             (!('lastMessage' in data) || (data.lastMessage is string && data.lastMessage.size() <= 100));
+    }
+
+    // Validate signaling message document data model
+    function isValidMessage(data) {
+      return hasRequiredFields(['type', 'senderId', 'roomId', 'timestamp']) &&
+             hasOnlyAllowedFields(['type', 'senderId', 'senderDevice', 'targetId', 'roomId', 'sdp', 'timestamp']) &&
+             data.type is string && data.type in ['join', 'join-reply', 'offer', 'answer', 'leave'] &&
+             data.senderId is string && data.senderId.size() >= 1 && data.senderId.size() <= 64 &&
+             (!('targetId' in data) || (data.targetId is string && data.targetId.size() >= 1 && data.targetId.size() <= 64)) &&
+             data.roomId is string && isValidRoomId(data.roomId) &&
+             isValidTimestampValue(data.timestamp) &&
+             (!('senderDevice' in data) || isValidSenderDevice(data.senderDevice)) &&
+             (!('sdp' in data) || isValidSdp(data.sdp));
+    }
+
+    // Validate ICE candidate document data model
+    function isValidCandidateDoc(data) {
+      return hasRequiredFields(['type', 'senderId', 'roomId', 'candidate', 'timestamp']) &&
+             hasOnlyAllowedFields(['type', 'senderId', 'targetId', 'roomId', 'candidate', 'timestamp']) &&
+             data.type == 'candidate' &&
+             data.senderId is string && data.senderId.size() >= 1 && data.senderId.size() <= 64 &&
+             (!('targetId' in data) || (data.targetId is string && data.targetId.size() >= 1 && data.targetId.size() <= 64)) &&
+             data.roomId is string && isValidRoomId(data.roomId) &&
+             isValidTimestampValue(data.timestamp) &&
+             isValidCandidateMap(data.candidate);
+    }
+
+    // ===============================================================
+    // Rules Definitions
+    // ===============================================================
+
+    // Root Default Deny: deny all reads and writes by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Rooms collection: ephemeral signaling rendezvous points
+    match /blinkdrop_rooms/{roomId} {
+      // Single room document retrieval allowed when room ID format is valid.
+      // Blanket collection listing is disallowed to prevent room enumeration and scraping.
+      allow get: if isValidRoomId(roomId);
+      allow list: if false;
+
+      // Create room: validate schema, format, and roomId match
+      allow create: if isValidRoomId(roomId) &&
+                       isValidRoom(request.resource.data) &&
+                       request.resource.data.roomId == roomId;
+
+      // Update room: validate schema, format, and enforce roomId immutability
+      allow update: if isValidRoomId(roomId) &&
+                       isValidRoom(request.resource.data) &&
+                       request.resource.data.roomId == roomId &&
+                       areImmutableFieldsUnchanged(['roomId']);
+
+      // Delete: disallowed to prevent active signaling disruption
+      allow delete: if false;
+
+      // Messages subcollection: session description and peer coordination
+      match /messages/{messageId} {
+        // Querying messages scoped to this room (e.g. limit(50)) and get single message
+        allow read: if isValidRoomId(roomId);
+
+        // Create message: validate schema, match roomId, enforce strict payload ban
+        allow create: if isValidRoomId(roomId) &&
+                         isValidMessage(request.resource.data) &&
+                         request.resource.data.roomId == roomId;
+
+        // Update message: enforce schema validation and immutability of core fields
+        allow update: if isValidRoomId(roomId) &&
+                         isValidMessage(request.resource.data) &&
+                         request.resource.data.roomId == roomId &&
+                         areImmutableFieldsUnchanged(['roomId', 'senderId', 'type', 'timestamp']);
+
+        // Delete: disallowed
+        allow delete: if false;
+      }
+
+      // Candidates subcollection: ICE network coordinates
+      match /candidates/{candidateId} {
+        // Querying candidates scoped to this room (e.g. limit(100)) and get single candidate
+        allow read: if isValidRoomId(roomId);
+
+        // Create candidate: validate schema, match roomId, enforce strict payload ban
+        allow create: if isValidRoomId(roomId) &&
+                         isValidCandidateDoc(request.resource.data) &&
+                         request.resource.data.roomId == roomId;
+
+        // Update candidate: enforce schema validation and immutability of core fields
+        allow update: if isValidRoomId(roomId) &&
+                         isValidCandidateDoc(request.resource.data) &&
+                         request.resource.data.roomId == roomId &&
+                         areImmutableFieldsUnchanged(['roomId', 'senderId', 'type', 'timestamp']);
+
+        // Delete: disallowed
+        allow delete: if false;
+      }
+    }
+  }
+}
